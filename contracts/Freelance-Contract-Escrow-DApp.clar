@@ -8,6 +8,10 @@
 (define-constant err-expired (err u106))
 (define-constant err-not-expired (err u107))
 
+(define-constant err-milestone-not-found (err u108))
+(define-constant err-milestone-already-completed (err u109))
+(define-constant err-invalid-milestone-amount (err u110))
+
 (define-data-var contract-id-nonce uint u0)
 
 (define-map contracts
@@ -310,5 +314,136 @@
     
     (map-delete contract-funds { contract-id: contract-id })
     (ok true)
+  )
+)
+
+
+(define-map contract-milestones
+  { contract-id: uint }
+  { 
+    total-milestones: uint,
+    completed-milestones: uint,
+    total-released: uint
+  }
+)
+
+(define-map milestones
+  { contract-id: uint, milestone-id: uint }
+  {
+    amount: uint,
+    description: (string-ascii 200),
+    completed: bool,
+    completed-at: (optional uint)
+  }
+)
+
+
+(define-read-only (get-contract-milestones (contract-id uint))
+  (map-get? contract-milestones { contract-id: contract-id })
+)
+
+(define-read-only (get-milestone (contract-id uint) (milestone-id uint))
+  (map-get? milestones { contract-id: contract-id, milestone-id: milestone-id })
+)
+
+
+(define-public (create-milestones (contract-id uint) (milestone-amounts (list 10 uint)) (milestone-descriptions (list 10 (string-ascii 200))))
+  (let
+    (
+      (contract-data (unwrap! (get-contract contract-id) err-not-found))
+      (total-milestone-amount (fold + milestone-amounts u0))
+      (milestone-count (len milestone-amounts))
+    )
+    (asserts! (is-eq tx-sender (get client contract-data)) err-unauthorized)
+    (asserts! (is-eq (get status contract-data) "active") err-invalid-status)
+    (asserts! (is-eq total-milestone-amount (get amount contract-data)) err-invalid-milestone-amount)
+    (asserts! (is-eq milestone-count (len milestone-descriptions)) err-invalid-milestone-amount)
+    (asserts! (> milestone-count u0) err-invalid-milestone-amount)
+    
+    (map-set contract-milestones
+      { contract-id: contract-id }
+      {
+        total-milestones: milestone-count,
+        completed-milestones: u0,
+        total-released: u0
+      }
+    )
+    (ok true)
+  )
+)
+
+(define-public (create-milestone (contract-id uint) (milestone-id uint) (amount uint) (description (string-ascii 200)))
+  (let
+    (
+      (contract-data (unwrap! (get-contract contract-id) err-not-found))
+      (milestone-info (get-contract-milestones contract-id))
+    )
+    (asserts! (is-eq tx-sender (get client contract-data)) err-unauthorized)
+    (asserts! (is-eq (get status contract-data) "active") err-invalid-status)
+    (asserts! (is-some milestone-info) err-not-found)
+    (asserts! (is-none (get-milestone contract-id milestone-id)) err-already-exists)
+    
+    (map-set milestones
+      { contract-id: contract-id, milestone-id: milestone-id }
+      {
+        amount: amount,
+        description: description,
+        completed: false,
+        completed-at: none
+      }
+    )
+    (ok true)
+  )
+)
+
+(define-public (complete-milestone (contract-id uint) (milestone-id uint))
+  (let
+    (
+      (contract-data (unwrap! (get-contract contract-id) err-not-found))
+      (milestone-data (unwrap! (get-milestone contract-id milestone-id) err-milestone-not-found))
+      (milestone-info (unwrap! (get-contract-milestones contract-id) err-not-found))
+    )
+    (asserts! (is-eq tx-sender (get client contract-data)) err-unauthorized)
+    (asserts! (is-eq (get status contract-data) "active") err-invalid-status)
+    (asserts! (not (get completed milestone-data)) err-milestone-already-completed)
+    (asserts! (not (get disputed contract-data)) err-invalid-status)
+    
+    (try! (as-contract (stx-transfer? (get amount milestone-data) tx-sender (get freelancer contract-data))))
+    
+    (map-set milestones
+      { contract-id: contract-id, milestone-id: milestone-id }
+      (merge milestone-data {
+        completed: true,
+        completed-at: (some stacks-block-height)
+      })
+    )
+    
+    (let
+      (
+        (new-completed (+ (get completed-milestones milestone-info) u1))
+        (new-released (+ (get total-released milestone-info) (get amount milestone-data)))
+      )
+      (map-set contract-milestones
+        { contract-id: contract-id }
+        (merge milestone-info {
+          completed-milestones: new-completed,
+          total-released: new-released
+        })
+      )
+      
+      (if (is-eq new-completed (get total-milestones milestone-info))
+        (begin
+          (map-set contracts
+            { contract-id: contract-id }
+            (merge contract-data {
+              status: "completed",
+              completed-at: (some stacks-block-height)
+            })
+          )
+          (ok true)
+        )
+        (ok true)
+      )
+    )
   )
 )
