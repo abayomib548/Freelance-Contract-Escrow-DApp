@@ -447,3 +447,86 @@
     )
   )
 )
+
+(define-map user-reputation
+  { user: principal }
+  {
+    total-contracts: uint,
+    completed-contracts: uint,
+    disputed-contracts: uint,
+    reputation-score: uint,
+    last-updated: uint
+  }
+)
+
+(define-read-only (get-user-reputation (user principal))
+  (default-to 
+    { total-contracts: u0, completed-contracts: u0, disputed-contracts: u0, reputation-score: u100, last-updated: u0 }
+    (map-get? user-reputation { user: user })
+  )
+)
+
+(define-read-only (calculate-reputation-score (completed uint) (total uint) (disputed uint))
+  (if (is-eq total u0)
+    u100
+    (let
+      (
+        (completion-rate (/ (* completed u100) total))
+        (dispute-penalty (* disputed u10))
+      )
+      (if (>= completion-rate dispute-penalty)
+        (- completion-rate dispute-penalty)
+        u0
+      )
+    )
+  )
+)
+
+(define-private (update-user-reputation (user principal) (contract-completed bool) (was-disputed bool))
+  (let
+    (
+      (current-rep (get-user-reputation user))
+      (new-total (+ (get total-contracts current-rep) u1))
+      (new-completed (if contract-completed 
+        (+ (get completed-contracts current-rep) u1) 
+        (get completed-contracts current-rep)))
+      (new-disputed (if was-disputed 
+        (+ (get disputed-contracts current-rep) u1) 
+        (get disputed-contracts current-rep)))
+    )
+    (map-set user-reputation
+      { user: user }
+      {
+        total-contracts: new-total,
+        completed-contracts: new-completed,
+        disputed-contracts: new-disputed,
+        reputation-score: (calculate-reputation-score new-completed new-total new-disputed),
+        last-updated: stacks-block-height
+      }
+    )
+  )
+)
+
+(define-public (update-reputation-on-completion (contract-id uint))
+  (let
+    (
+      (contract-data (unwrap! (get-contract contract-id) err-not-found))
+    )
+    (asserts! (is-eq (get status contract-data) "completed") err-invalid-status)
+    (update-user-reputation (get client contract-data) true false)
+    (update-user-reputation (get freelancer contract-data) true false)
+    (ok true)
+  )
+)
+
+(define-public (update-reputation-on-dispute (contract-id uint))
+  (let
+    (
+      (contract-data (unwrap! (get-contract contract-id) err-not-found))
+    )
+    (asserts! (get disputed contract-data) err-invalid-status)
+    (update-user-reputation (get client contract-data) false true)
+    (update-user-reputation (get freelancer contract-data) false true)
+    (ok true)
+  )
+)
