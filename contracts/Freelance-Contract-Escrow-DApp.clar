@@ -8,6 +8,10 @@
 (define-constant err-expired (err u106))
 (define-constant err-not-expired (err u107))
 
+(define-constant err-amendment-pending (err u111))
+(define-constant err-amendment-not-found (err u112))
+(define-constant err-amendment-unauthorized (err u113))
+
 (define-constant err-milestone-not-found (err u108))
 (define-constant err-milestone-already-completed (err u109))
 (define-constant err-invalid-milestone-amount (err u110))
@@ -528,5 +532,109 @@
     (update-user-reputation (get client contract-data) false true)
     (update-user-reputation (get freelancer contract-data) false true)
     (ok true)
+  )
+)
+
+(define-map contract-amendments
+  { contract-id: uint }
+  {
+    proposed-by: principal,
+    new-amount: (optional uint),
+    new-deadline: (optional uint),
+    new-description: (optional (string-ascii 500)),
+    status: (string-ascii 10),
+    proposed-at: uint,
+    approved-at: (optional uint)
+  }
+)
+
+(define-read-only (get-contract-amendment (contract-id uint))
+  (map-get? contract-amendments { contract-id: contract-id })
+)
+
+(define-read-only (has-pending-amendment (contract-id uint))
+  (match (get-contract-amendment contract-id)
+    amendment (is-eq (get status amendment) "pending")
+    false
+  )
+)
+
+(define-public (propose-amendment (contract-id uint) (new-amount (optional uint)) (new-deadline (optional uint)) (new-description (optional (string-ascii 500))))
+  (let
+    (
+      (contract-data (unwrap! (get-contract contract-id) err-not-found))
+    )
+    (asserts! (or (is-eq tx-sender (get client contract-data)) (is-eq tx-sender (get freelancer contract-data))) err-unauthorized)
+    (asserts! (is-eq (get status contract-data) "active") err-invalid-status)
+    (asserts! (not (get disputed contract-data)) err-invalid-status)
+    (asserts! (not (has-pending-amendment contract-id)) err-amendment-pending)
+    (asserts! (or (is-some new-amount) (is-some new-deadline) (is-some new-description)) err-invalid-status)
+    
+    (map-set contract-amendments
+      { contract-id: contract-id }
+      {
+        proposed-by: tx-sender,
+        new-amount: new-amount,
+        new-deadline: new-deadline,
+        new-description: new-description,
+        status: "pending",
+        proposed-at: stacks-block-height,
+        approved-at: none
+      }
+    )
+    (ok true)
+  )
+)
+
+(define-public (approve-amendment (contract-id uint))
+  (let
+    (
+      (contract-data (unwrap! (get-contract contract-id) err-not-found))
+      (amendment-data (unwrap! (get-contract-amendment contract-id) err-amendment-not-found))
+      (fund-data (unwrap! (get-contract-funds contract-id) err-not-found))
+      (other-party (if (is-eq tx-sender (get client contract-data)) (get freelancer contract-data) (get client contract-data)))
+    )
+    (asserts! (or (is-eq tx-sender (get client contract-data)) (is-eq tx-sender (get freelancer contract-data))) err-unauthorized)
+    (asserts! (not (is-eq tx-sender (get proposed-by amendment-data))) err-amendment-unauthorized)
+    (asserts! (is-eq (get status amendment-data) "pending") err-invalid-status)
+    (asserts! (not (get disputed contract-data)) err-invalid-status)
+    
+    (let
+      (
+        (final-amount (default-to (get amount contract-data) (get new-amount amendment-data)))
+        (final-deadline (default-to (get deadline contract-data) (get new-deadline amendment-data)))
+        (final-description (default-to (get description contract-data) (get new-description amendment-data)))
+        (amount-diff (if (> final-amount (get amount contract-data)) 
+          (- final-amount (get amount contract-data))
+          u0))
+      )
+      (if (> amount-diff u0)
+        (try! (stx-transfer? amount-diff (get client contract-data) (as-contract tx-sender)))
+        true
+      )
+      
+      (map-set contracts
+        { contract-id: contract-id }
+        (merge contract-data {
+          amount: final-amount,
+          deadline: final-deadline,
+          description: final-description
+        })
+      )
+      
+      (map-set contract-funds
+        { contract-id: contract-id }
+        { amount: final-amount }
+      )
+      
+      (map-set contract-amendments
+        { contract-id: contract-id }
+        (merge amendment-data {
+          status: "approved",
+          approved-at: (some stacks-block-height)
+        })
+      )
+      (ok true)
+    )
   )
 )
