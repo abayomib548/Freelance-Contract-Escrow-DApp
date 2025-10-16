@@ -16,6 +16,10 @@
 (define-constant err-milestone-already-completed (err u109))
 (define-constant err-invalid-milestone-amount (err u110))
 
+(define-constant err-refund-already-proposed (err u114))
+(define-constant err-refund-not-found (err u115))
+(define-constant err-invalid-percentage (err u116))
+
 (define-data-var contract-id-nonce uint u0)
 
 (define-map contracts
@@ -636,5 +640,86 @@
       )
       (ok true)
     )
+  )
+)
+
+
+(define-map partial-refund-proposals
+  { contract-id: uint }
+  {
+    proposed-by: principal,
+    refund-percentage: uint,
+    status: (string-ascii 10),
+    proposed-at: uint
+  }
+)
+
+(define-read-only (get-refund-proposal (contract-id uint))
+  (map-get? partial-refund-proposals { contract-id: contract-id })
+)
+
+(define-public (propose-partial-refund (contract-id uint) (refund-percentage uint))
+  (let
+    (
+      (contract-data (unwrap! (get-contract contract-id) err-not-found))
+    )
+    (asserts! (is-eq tx-sender (get client contract-data)) err-unauthorized)
+    (asserts! (or (is-eq (get status contract-data) "active") (is-eq (get status contract-data) "submitted")) err-invalid-status)
+    (asserts! (not (get disputed contract-data)) err-invalid-status)
+    (asserts! (and (> refund-percentage u0) (<= refund-percentage u100)) err-invalid-percentage)
+    (asserts! (is-none (get-refund-proposal contract-id)) err-refund-already-proposed)
+    
+    (map-set partial-refund-proposals
+      { contract-id: contract-id }
+      {
+        proposed-by: tx-sender,
+        refund-percentage: refund-percentage,
+        status: "pending",
+        proposed-at: stacks-block-height
+      }
+    )
+    (ok true)
+  )
+)
+
+(define-public (accept-partial-refund (contract-id uint))
+  (let
+    (
+      (contract-data (unwrap! (get-contract contract-id) err-not-found))
+      (proposal (unwrap! (get-refund-proposal contract-id) err-refund-not-found))
+      (fund-data (unwrap! (get-contract-funds contract-id) err-not-found))
+      (total-amount (get amount fund-data))
+      (refund-amount (/ (* total-amount (get refund-percentage proposal)) u100))
+      (freelancer-amount (- total-amount refund-amount))
+    )
+    (asserts! (is-eq tx-sender (get freelancer contract-data)) err-unauthorized)
+    (asserts! (is-eq (get status proposal) "pending") err-invalid-status)
+    (asserts! (not (get disputed contract-data)) err-invalid-status)
+    
+    (if (> refund-amount u0)
+      (try! (as-contract (stx-transfer? refund-amount tx-sender (get client contract-data))))
+      true
+    )
+    
+    (if (> freelancer-amount u0)
+      (try! (as-contract (stx-transfer? freelancer-amount tx-sender (get freelancer contract-data))))
+      true
+    )
+    
+    (map-set contracts
+      { contract-id: contract-id }
+      (merge contract-data {
+        status: "completed",
+        completed-at: (some stacks-block-height)
+      })
+    )
+    
+    (map-set partial-refund-proposals
+      { contract-id: contract-id }
+      (merge proposal { status: "accepted" })
+    )
+    
+    (map-delete contract-funds { contract-id: contract-id })
+    (ok true)
   )
 )
