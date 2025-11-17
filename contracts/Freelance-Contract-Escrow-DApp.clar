@@ -723,3 +723,77 @@
     (ok true)
   )
 )
+
+(define-constant err-auto-release-not-ready (err u117))
+
+(define-map work-submissions
+  { contract-id: uint }
+  { 
+    submitted-at: uint,
+    auto-release-blocks: uint
+  }
+)
+
+(define-read-only (get-work-submission (contract-id uint))
+  (map-get? work-submissions { contract-id: contract-id })
+)
+
+(define-read-only (can-auto-release (contract-id uint))
+  (match (get-work-submission contract-id)
+    submission (>= stacks-block-height (+ (get submitted-at submission) (get auto-release-blocks submission)))
+    false
+  )
+)
+
+(define-public (submit-work-with-auto-release (contract-id uint) (auto-release-blocks uint))
+  (let
+    (
+      (contract-data (unwrap! (get-contract contract-id) err-not-found))
+    )
+    (asserts! (is-eq tx-sender (get freelancer contract-data)) err-unauthorized)
+    (asserts! (is-eq (get status contract-data) "active") err-invalid-status)
+    (asserts! (not (get disputed contract-data)) err-invalid-status)
+    (asserts! (> auto-release-blocks u0) err-invalid-status)
+    
+    (map-set contracts
+      { contract-id: contract-id }
+      (merge contract-data { status: "submitted" })
+    )
+    
+    (map-set work-submissions
+      { contract-id: contract-id }
+      {
+        submitted-at: stacks-block-height,
+        auto-release-blocks: auto-release-blocks
+      }
+    )
+    (ok true)
+  )
+)
+
+(define-public (trigger-auto-release (contract-id uint))
+  (let
+    (
+      (contract-data (unwrap! (get-contract contract-id) err-not-found))
+      (fund-data (unwrap! (get-contract-funds contract-id) err-not-found))
+    )
+    (asserts! (is-eq tx-sender (get freelancer contract-data)) err-unauthorized)
+    (asserts! (is-eq (get status contract-data) "submitted") err-invalid-status)
+    (asserts! (not (get disputed contract-data)) err-invalid-status)
+    (asserts! (can-auto-release contract-id) err-auto-release-not-ready)
+    
+    (try! (as-contract (stx-transfer? (get amount fund-data) tx-sender (get freelancer contract-data))))
+    
+    (map-set contracts
+      { contract-id: contract-id }
+      (merge contract-data { 
+        status: "completed",
+        completed-at: (some stacks-block-height)
+      })
+    )
+    
+    (map-delete contract-funds { contract-id: contract-id })
+    (map-delete work-submissions { contract-id: contract-id })
+    (ok true)
+  )
+)
